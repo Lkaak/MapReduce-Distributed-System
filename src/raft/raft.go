@@ -68,7 +68,6 @@ const (
 	ElectionTimeOut  = time.Millisecond * 300
 	HeartBeatTimeout = time.Millisecond * 150
 	RPCTimeout       = time.Millisecond * 100
-	MaxLockTime      = time.Millisecond * 10
 	//ApplyInterVal    = time.Millisecond * 100
 )
 
@@ -100,13 +99,6 @@ type Raft struct {
 	//time，注意需要为指针才能改变
 	electionTimer     *time.Timer   //选举超时计时器
 	appendEntryTimers []*time.Timer //leader记录的给每一个follower发送AE的计时器
-	//applyTimer        *time.Timer   //应用计时器
-
-	//Debug
-	DebugLog  bool
-	lockStart time.Time
-	lockEnd   time.Time
-	lockName  string
 
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
@@ -373,8 +365,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 	// initialize from
 	//state persisted before a crash
-	rf.DebugLog = false
-	//Debug日志开关
 
 	rf.readPersist(persister.ReadRaftState())
 	rf.term = 0
