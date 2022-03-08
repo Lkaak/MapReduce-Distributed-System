@@ -49,8 +49,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.changeRole(Follower)
 	}
 	//检查是否满足投票结果
-	lastLogTerm, lastLotIndex := rf.lastLogTermIndex()
-	if lastLogTerm > args.LastLogTerm || (lastLotIndex == args.LastLogTerm && lastLotIndex > args.LastLogIndex) {
+	lastLogTerm, lastLogIndex := rf.lastLogTermIndex()
+	if lastLogTerm > args.LastLogTerm || (lastLogIndex == args.LastLogTerm && lastLogTerm > args.LastLogIndex) {
 		return
 	}
 	//满足所有条件且没有投过票
