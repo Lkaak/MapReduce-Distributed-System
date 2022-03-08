@@ -50,7 +50,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	//检查是否满足投票结果
 	lastLogTerm, lastLogIndex := rf.lastLogTermIndex()
-	if lastLogTerm > args.LastLogTerm || (lastLogIndex == args.LastLogTerm && lastLogTerm > args.LastLogIndex) {
+	if lastLogTerm > args.LastLogTerm || (lastLogTerm == args.LastLogTerm && lastLogIndex > args.LastLogIndex) {
 		return
 	}
 	//满足所有条件且没有投过票
