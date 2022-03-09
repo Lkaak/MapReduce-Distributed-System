@@ -128,14 +128,11 @@ func (rf *Raft) startElection() {
 			rf.sendRequestVote(index, &args, &reply)
 			votesCh <- reply.VoteGranted
 			//检测返回结果的term大小
-			if reply.Term > args.Term {
+			if reply.Term > rf.term {
 				rf.mu.Lock()
-				if rf.term < reply.Term {
-					//因为可能rf在传入args后term发生了增长，所以还需要进一步比较
-					rf.term = reply.Term
-					rf.changeRole(Follower)
-					rf.resetElectionTimer()
-				}
+				rf.term = reply.Term
+				rf.changeRole(Follower)
+				rf.resetElectionTimer()
 				rf.mu.Unlock()
 			}
 		}(votesCh, index)

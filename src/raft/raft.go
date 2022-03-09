@@ -418,7 +418,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 	rf.term = 0
 	rf.role = Follower
-	rf.logEntries = make([]LogEntry, 0, 100)
 	rf.votedFor = -1
 	rf.electionTimer = time.NewTimer(randElectionTimeout())
 	rf.appendEntryTimers = make([]*time.Timer, len(rf.peers))
