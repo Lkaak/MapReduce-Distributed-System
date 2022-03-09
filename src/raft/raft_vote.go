@@ -22,6 +22,7 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
+
 	defer rf.mu.Unlock()
 	defer func() {
 		DPrintf("%d receive Request args:%+v, reply:%+v", rf.me, args, reply)
@@ -71,14 +72,13 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 		rpcTimer.Stop()
 		rpcTimer.Reset(RPCTimeout)
 		ch := make(chan bool, 1) //用于通知结果
-		r := &RequestVoteReply{} //调用rpc后的返回结果，只有成功后再返回
-		go func() {
-			ok := rf.peers[server].Call("Raft.RequestVote", args, r)
+		go func(args *RequestVoteArgs, reply *RequestVoteReply) {
+			ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 			if ok == false {
 				time.Sleep(time.Millisecond * 10)
 			}
 			ch <- ok
-		}()
+		}(args, reply)
 		select {
 		case <-rpcTimer.C:
 			return
@@ -86,8 +86,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 			if !ok {
 				continue
 			} else {
-				reply.VoteGranted = r.VoteGranted
-				reply.Term = r.Term
 				return
 			}
 		}

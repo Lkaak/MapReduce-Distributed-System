@@ -71,7 +71,7 @@ const (
 	ElectionTimeOut  = time.Millisecond * 300
 	HeartBeatTimeout = time.Millisecond * 150
 	RPCTimeout       = time.Millisecond * 100
-	//ApplyInterVal    = time.Millisecond * 100
+	ApplyInterVal    = time.Millisecond * 100
 )
 
 type LogEntry struct {
@@ -89,20 +89,21 @@ type Raft struct {
 
 	// Your data here (2A, 2B, 2C).
 	//2A
-	term        int           //当前peer所处的任期
-	votedFor    int           //投票
-	logEntries  []LogEntry    //日志文件
-	commitIndex int           //已经提交的日志下标
-	lastApplied int           //当前已经应用的最新的日志下标
-	nextIndex   []int         //下一个日志的位置
-	matchIndex  []int         //leader与其他follower匹配的位置
-	role        Role          //当前角色
-	applyCh     chan ApplyMsg //接收已提交的日志文件
+	term          int           //当前peer所处的任期
+	votedFor      int           //投票
+	logEntries    []LogEntry    //日志文件
+	commitIndex   int           //已经提交的日志下标
+	lastApplied   int           //当前已经应用的最新的日志下标
+	nextIndex     []int         //下一个日志的位置
+	matchIndex    []int         //leader与其他follower匹配的位置
+	role          Role          //当前角色
+	applyCh       chan ApplyMsg //接收已提交的日志文件
+	notifyApplyCh chan struct{} //通知通道
 
 	//time，注意需要为指针才能改变
 	electionTimer     *time.Timer   //选举超时计时器
 	appendEntryTimers []*time.Timer //leader记录的给每一个follower发送AE的计时器
-
+	applyTimer        *time.Timer   //应用消息计时器
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
@@ -256,12 +257,28 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	rf.mu.Lock()
+	_, lastIndex := rf.lastLogTermIndex()
+	index := lastIndex + 1
+	term := rf.term
+	isLeader := false
+	if rf.role == Leader {
+		isLeader = true
+	}
+	if isLeader {
+		newLog := LogEntry{
+			Term:    term,
+			Idx:     index,
+			Command: command,
+		}
 
+		rf.logEntries = append(rf.logEntries, newLog)
+		rf.matchIndex[rf.me] = index
+		DPrintf("leader has new log,rf:%d,term:%d:newlog:%v", rf.me, rf.term, newLog)
+	}
 	// Your code here (2B).
-
+	rf.resetHeartBeatTimers()
+	rf.mu.Unlock()
 	return index, term, isLeader
 }
 
@@ -292,7 +309,8 @@ func (rf *Raft) ticker() {
 	for {
 		//等待超时
 		<-rf.electionTimer.C
-		DPrintf("%v electionTimer out", rf.me)
+		//DPrintf("%v electionTimer out", rf.me)
+
 		rf.startElection()
 	}
 }
@@ -305,7 +323,7 @@ func (rf *Raft) resetElectionTimer() {
 func (rf *Raft) resetHeartBeatTimers() {
 	for i, _ := range rf.appendEntryTimers {
 		rf.appendEntryTimers[i].Stop()
-		rf.appendEntryTimers[i].Reset(0)
+		rf.appendEntryTimers[i].Reset(HeartBeatTimeout)
 	}
 }
 
@@ -344,6 +362,37 @@ func (rf *Raft) changeRole(role Role) {
 	}
 }
 
+//应用消息
+func (rf *Raft) startApply() {
+	rf.mu.Lock()
+	rf.applyTimer.Reset(ApplyInterVal)
+	var applyMsgs []ApplyMsg
+	if rf.commitIndex <= rf.lastApplied {
+		applyMsgs = make([]ApplyMsg, 0)
+		//DPrintf("No messages need apply")
+	} else {
+		//DPrintf("rf%d :Messages need apply,log:%v,commitIndex:%d,lastApplied:%d", rf.me, rf.logEntries, rf.commitIndex, rf.lastApplied)
+		applyMsgs = make([]ApplyMsg, 0, rf.commitIndex-rf.lastApplied)
+		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+			newMessage := ApplyMsg{
+				CommandValid: true,
+				Command:      rf.logEntries[i].Command,
+				CommandIndex: i,
+			}
+			applyMsgs = append(applyMsgs, newMessage)
+		}
+	}
+	rf.mu.Unlock()
+	//DPrintf("start apply messages")
+	for _, msg := range applyMsgs {
+		rf.applyCh <- msg
+		rf.mu.Lock()
+		rf.lastApplied = msg.CommandIndex
+		//DPrintf("megs applied idx:%d", msg.CommandIndex)
+		rf.mu.Unlock()
+	}
+}
+
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -366,18 +415,30 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 	// initialize from
 	//state persisted before a crash
-
 	rf.readPersist(persister.ReadRaftState())
 	rf.term = 0
 	rf.role = Follower
-	rf.logEntries = make([]LogEntry, 1)
+	rf.logEntries = make([]LogEntry, 0, 100)
 	rf.votedFor = -1
 	rf.electionTimer = time.NewTimer(randElectionTimeout())
 	rf.appendEntryTimers = make([]*time.Timer, len(rf.peers))
+	rf.logEntries = make([]LogEntry, 1) //存储日志快照
 	for i, _ := range rf.peers {
 		rf.appendEntryTimers[i] = time.NewTimer(HeartBeatTimeout)
 	}
-
+	rf.applyTimer = time.NewTimer(ApplyInterVal)
+	rf.notifyApplyCh = make(chan struct{}, 100)
+	//应用日志
+	go func() {
+		for {
+			select {
+			case <-rf.applyTimer.C:
+				rf.notifyApplyCh <- struct{}{}
+			case <-rf.notifyApplyCh:
+				rf.startApply()
+			}
+		}
+	}()
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
