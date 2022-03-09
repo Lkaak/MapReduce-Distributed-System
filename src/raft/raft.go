@@ -18,7 +18,6 @@ package raft
 //
 
 import (
-	"fmt"
 	"math/rand"
 	//	"bytes"
 	"sync"
@@ -57,6 +56,10 @@ type ApplyMsg struct {
 //
 
 type Role int
+
+func init() {
+	rand.Seed(time.Now().Unix())
+}
 
 const (
 	Follower  Role = 0
@@ -107,7 +110,6 @@ type Raft struct {
 
 //随机选举超时时间
 func randElectionTimeout() time.Duration {
-	rand.Seed(time.Now().Unix())
 	r := time.Duration(rand.Int63()) % ElectionTimeOut
 	return r + ElectionTimeOut
 }
@@ -291,7 +293,6 @@ func (rf *Raft) ticker() {
 		//等待超时
 		<-rf.electionTimer.C
 		DPrintf("%v electionTimer out", rf.me)
-		fmt.Printf("\r")
 		rf.startElection()
 	}
 }
