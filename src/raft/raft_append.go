@@ -23,16 +23,6 @@ func (rf *Raft) getNextIndex() int {
 	return index + 1
 }
 
-//检测请求的正确性，因为RPC请求可能出现丢失preLogindex和preLogTerm信息的问题
-func (rf *Raft) outOfOrderAppend(args *AppendEntriesArgs) bool {
-	argsLastIndex := args.PrevLogIndex + len(args.Entries)
-	lastTerm, lastIndex := rf.lastLogTermIndex()
-	if argsLastIndex < lastIndex && lastTerm == args.Term {
-		return true
-	}
-	return false
-}
-
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	DPrintf("rf:%d,term:%d receive AppendEntry form %d,logs:%v,leaderterm:%d", rf.me, rf.term, args.LeaderId, args.Entries, args.Term)
@@ -52,14 +42,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		reply.NextIndex = rf.getNextIndex()
 	} else if rf.logEntries[args.PrevLogIndex].Term == args.PrevLogTerm {
-		//if rf.outOfOrderAppend(args) {
-		//	//检查请求是不是正确的
-		//	reply.Success = false
-		//	reply.NextIndex = 0
-		//} else {
-		//follower的没有缺少或者有多余logs
-		//无论哪种，只要preLogIndex的term对的上，就说明这个位置的log能够匹配
-		//只需要将preLogIndex以前的日志和AE的日志合并
 		reply.Success = true
 		//DPrintf("rf%d:log %v need be append,preLogindex:%d", rf.me, args.Entries, args.PrevLogIndex)
 		rf.logEntries = append(rf.logEntries[:args.PrevLogIndex+1], args.Entries...)
@@ -217,13 +199,11 @@ func (rf *Raft) sendAppendEntries(peerId int) {
 			}
 			rf.mu.Unlock()
 			return
-		} else if reply.NextIndex != 0 {
+		} else {
 			//失败后重新设置NextIndex再发送
 			rf.nextIndex[peerId] = reply.NextIndex
 			rf.mu.Unlock()
 			continue
-		} else {
-			rf.mu.Unlock()
 		}
 	}
 }
