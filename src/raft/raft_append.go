@@ -34,6 +34,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	rf.term = args.Term
 	rf.changeRole(Follower)
+	rf.persist()
 	rf.resetElectionTimer()
 	//确定nextIndex
 	_, lastLogIndex := rf.lastLogTermIndex()
@@ -47,6 +48,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.logEntries = append(rf.logEntries[:args.PrevLogIndex+1], args.Entries...)
 		DPrintf("append success,rf:%d,term:%d,logs : %v", rf.me, rf.term, rf.logEntries)
 		reply.NextIndex = rf.getNextIndex()
+		rf.persist()
 		//}
 	} else {
 		//不能匹配则返回当前term的第一个index
@@ -73,7 +75,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 func (rf *Raft) getAppendLogs(index int) (preLogIndex, preLogTerm int, logs []LogEntry) {
 	nextIndex := rf.nextIndex[index]
 	lastTerm, lastIndex := rf.lastLogTermIndex()
-	//DPrintf("rf%d:lastTerm %d lastIndex %d,nextindex:%d", rf.me, lastTerm, lastIndex, nextIndex)
+	DPrintf("rf%d:lastTerm %d lastIndex %d,nextindex:%d", rf.me, lastTerm, lastIndex, nextIndex)
 	if nextIndex > lastIndex {
 		//说明没有需要新增的日志
 		preLogTerm = lastTerm
@@ -181,6 +183,7 @@ func (rf *Raft) sendAppendEntries(peerId int) {
 			rf.changeRole(Follower)
 			rf.resetElectionTimer()
 			rf.term = reply.Term
+			rf.persist()
 			rf.mu.Unlock()
 			return
 		}

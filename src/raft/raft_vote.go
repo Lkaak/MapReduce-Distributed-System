@@ -47,6 +47,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		//收到的Term大于自身的则先进行自我更新
 		rf.term = args.Term
 		rf.votedFor = -1
+		rf.persist()
 		rf.changeRole(Follower)
 	}
 	//检查是否满足投票结果
@@ -59,6 +60,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.votedFor = args.CandidateId
 	rf.changeRole(Follower)
 	reply.VoteGranted = true
+	rf.persist()
 	rf.resetElectionTimer()
 	return
 }
@@ -111,6 +113,7 @@ func (rf *Raft) startElection() {
 		LastLogIndex: lastLogIndex,
 		LastLogTerm:  lastLogTerm,
 	}
+	rf.persist()
 	rf.mu.Unlock()
 	//发送request并统计结果
 	grantVotes := 1                           //获取票数
@@ -133,6 +136,7 @@ func (rf *Raft) startElection() {
 				rf.term = reply.Term
 				rf.changeRole(Follower)
 				rf.resetElectionTimer()
+				rf.persist()
 				rf.mu.Unlock()
 			}
 		}(votesCh, index)
@@ -161,7 +165,7 @@ func (rf *Raft) startElection() {
 	if rf.term == args.Term && rf.role == Candidate {
 		//还要检查是不是和发起请求的状态一致
 		rf.changeRole(Leader)
-		DPrintf("%d become leader", rf.me)
+		DPrintf("%d become leader,nextIndex:%v", rf.me, rf.nextIndex)
 	}
 	rf.mu.Unlock()
 }
