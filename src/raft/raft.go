@@ -141,16 +141,20 @@ func (rf *Raft) GetState() (int, bool) {
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 //
-func (rf *Raft) persist() {
 
-	// Your code here (2C).
+func (rf *Raft) persist() {
+	data := rf.getPersistData()
+	rf.persister.SaveRaftState(data)
+}
+
+func (rf *Raft) getPersistData() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.term)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.logEntries)
 	data := w.Bytes()
-	rf.persister.SaveRaftState(data)
+	return data
 }
 
 //
@@ -176,43 +180,6 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.logEntries = logEntries
 	}
 }
-
-//
-// A service wants to switch to snapshot.  Only do so if Raft hasn't
-// have more recent info since it communicate the snapshot on applyCh.
-//
-func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
-
-	// Your code here (2D).
-
-	return true
-}
-
-// the service says it has created a snapshot that has
-// all info up to and including index. this means the
-// service no longer needs the log through (and including)
-// that index. Raft should now trim its log as much as possible.
-func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (2D).
-
-}
-
-//
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
-//
-
-//
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-//
-
-//
-// example RequestVote RPC handler.
-//
-//func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-//	// Your code here (2A, 2B).
-//}
 
 //
 // example code to send a RequestVote RPC to a server.
@@ -243,11 +210,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 //
-//func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-//	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-//	return ok
-//}
-
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -277,7 +239,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			Idx:     index,
 			Command: command,
 		}
-
 		rf.logEntries = append(rf.logEntries, newLog)
 		rf.matchIndex[rf.me] = index
 		rf.persist()
@@ -316,8 +277,7 @@ func (rf *Raft) ticker() {
 	for {
 		//等待超时
 		<-rf.electionTimer.C
-		//DPrintf("%v electionTimer out", rf.me)
-
+		DPrintf("%v electionTimer out", rf.me)
 		rf.startElection()
 	}
 }
@@ -341,8 +301,18 @@ func (rf *Raft) resetHeartBeatTimer(index int) {
 
 func (rf *Raft) lastLogTermIndex() (int, int) {
 	term := rf.logEntries[len(rf.logEntries)-1].Term
-	index := len(rf.logEntries) - 1
+	index := rf.logEntries[0].Idx + len(rf.logEntries) - 1
 	return term, index
+}
+
+func (rf *Raft) getRealIndex(idx int) int {
+	realIdx := idx - rf.logEntries[0].Idx
+	if realIdx < 0 {
+		DPrintf("rf:%d,idx:%d,snapIndex:%d,lastApply:%d", rf.me, idx, rf.logEntries[0].Idx, rf.lastApplied)
+		return -1
+	} else {
+		return realIdx
+	}
 }
 
 //修改角色后进行的任务
@@ -377,26 +347,24 @@ func (rf *Raft) startApply() {
 	var applyMsgs []ApplyMsg
 	if rf.commitIndex <= rf.lastApplied {
 		applyMsgs = make([]ApplyMsg, 0)
-		//DPrintf("No messages need apply")
 	} else {
-		//DPrintf("rf%d :Messages need apply,log:%v,commitIndex:%d,lastApplied:%d", rf.me, rf.logEntries, rf.commitIndex, rf.lastApplied)
+		DPrintf("rf%d :Messages need apply,log:%v,commitIndex:%d,lastApplied:%d", rf.me, rf.logEntries, rf.commitIndex, rf.lastApplied)
 		applyMsgs = make([]ApplyMsg, 0, rf.commitIndex-rf.lastApplied)
 		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 			newMessage := ApplyMsg{
 				CommandValid: true,
-				Command:      rf.logEntries[i].Command,
+				Command:      rf.logEntries[rf.getRealIndex(i)].Command,
 				CommandIndex: i,
 			}
 			applyMsgs = append(applyMsgs, newMessage)
 		}
 	}
 	rf.mu.Unlock()
-	//DPrintf("start apply messages")
 	for _, msg := range applyMsgs {
 		rf.applyCh <- msg
 		rf.mu.Lock()
 		rf.lastApplied = msg.CommandIndex
-		//DPrintf("megs applied idx:%d", msg.CommandIndex)
+		DPrintf("megs applied idx:%d", msg.CommandIndex)
 		rf.mu.Unlock()
 	}
 }
@@ -419,7 +387,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 	// Your initialization code here (2A, 2B, 2C).
-	//2A
 	rf.applyCh = applyCh
 	// initialize from
 	//state persisted before a crash
@@ -430,6 +397,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.appendEntryTimers = make([]*time.Timer, len(rf.peers))
 	rf.logEntries = make([]LogEntry, 1) //存储日志快照
 	rf.readPersist(persister.ReadRaftState())
+	//如果从持久化中读取到了快照，则需要对lastapplied进行更新
+	if rf.logEntries[0].Idx > 0 {
+		rf.lastApplied = rf.logEntries[0].Idx
+	}
 	for i, _ := range rf.peers {
 		rf.appendEntryTimers[i] = time.NewTimer(HeartBeatTimeout)
 	}
@@ -447,8 +418,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		}
 	}()
 	// start ticker goroutine to start elections
+	//开始选举
 	go rf.ticker()
-
 	//发送日志
 	for i, _ := range peers {
 		if i == rf.me {

@@ -25,7 +25,7 @@ func (rf *Raft) getNextIndex() int {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
-	DPrintf("rf:%d,term:%d receive AppendEntry form %d,logs:%v,leaderterm:%d", rf.me, rf.term, args.LeaderId, args.Entries, args.Term)
+	//DPrintf("rf:%d,term:%d receive AppendEntry form %d,logs:%v,leaderterm:%d", rf.me, rf.term, args.LeaderId, args.Entries, args.Term)
 	reply.Term = rf.term
 	if rf.term > args.Term {
 		reply.Success = false
@@ -38,21 +38,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.resetElectionTimer()
 	//确定nextIndex
 	_, lastLogIndex := rf.lastLogTermIndex()
-	if args.PrevLogIndex > lastLogIndex {
+	if args.PrevLogIndex < rf.logEntries[0].Idx {
+		//preLogIndex小于快照，则设置nextIndex为快照后的第一个同步
+		//这种情况一般出现在服务器断连后利用InstallSnap同步后，服务器的nextIndex没有更新导致prevLogIndex小于快照的index
+		reply.Success = false
+		reply.NextIndex = rf.logEntries[0].Idx + 1
+	} else if args.PrevLogIndex > lastLogIndex {
 		//follower缺少logs
 		reply.Success = false
 		reply.NextIndex = rf.getNextIndex()
-	} else if rf.logEntries[args.PrevLogIndex].Term == args.PrevLogTerm {
+	} else if rf.logEntries[rf.getRealIndex(args.PrevLogIndex)].Term == args.PrevLogTerm {
+		//prevLog成功匹配，这种情况也包括了刚好前一个就是快照。
 		reply.Success = true
-		//DPrintf("rf%d:log %v need be append,preLogindex:%d", rf.me, args.Entries, args.PrevLogIndex)
-		rf.logEntries = append(rf.logEntries[:args.PrevLogIndex+1], args.Entries...)
+		rf.logEntries = append(rf.logEntries[:rf.getRealIndex(args.PrevLogIndex)+1], args.Entries...)
 		DPrintf("append success,rf:%d,term:%d,logs : %v", rf.me, rf.term, rf.logEntries)
 		reply.NextIndex = rf.getNextIndex()
 		rf.persist()
-		//}
 	} else {
 		//不能匹配则返回当前term的第一个index
-		//DPrintf("preLog not match")
 		reply.Success = false
 		term := rf.logEntries[args.PrevLogIndex].Term
 		index := args.PrevLogIndex
@@ -75,9 +78,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 func (rf *Raft) getAppendLogs(index int) (preLogIndex, preLogTerm int, logs []LogEntry) {
 	nextIndex := rf.nextIndex[index]
 	lastTerm, lastIndex := rf.lastLogTermIndex()
-	DPrintf("rf%d:lastTerm %d lastIndex %d,nextindex:%d", rf.me, lastTerm, lastIndex, nextIndex)
-	if nextIndex > lastIndex {
-		//说明没有需要新增的日志
+	//DPrintf("rf%d:lastTerm %d lastIndex %d,nextindex:%d", rf.me, lastTerm, lastIndex, nextIndex)
+	if nextIndex > lastIndex || nextIndex <= rf.logEntries[0].Idx {
+		//说明没有需要新增的日志，或者nextIndex被压缩为快照了，则直接发送自身的最后一个日志的Index和term
 		preLogTerm = lastTerm
 		preLogIndex = lastIndex
 		//DPrintf("preLogTerm%d,preLogIndex%d", preLogTerm, preLogIndex)
@@ -86,10 +89,13 @@ func (rf *Raft) getAppendLogs(index int) (preLogIndex, preLogTerm int, logs []Lo
 	}
 	//DPrintf("rf%d,:logs:%v,nextIndex:%d,lastIndex:%d,preLogIndex:%d", rf.me, rf.logEntries, nextIndex, lastIndex, preLogIndex)
 	//将从nextIndex开始往后的所有日志加入待添加日志
-	logs = append(logs, rf.logEntries[nextIndex:]...)
+	logs = append(logs, rf.logEntries[rf.getRealIndex(nextIndex):]...)
 	//DPrintf("rf%d:logs:%v", rf.me, logs)
 	preLogIndex = nextIndex - 1
-	preLogTerm = rf.logEntries[preLogIndex].Term
+	if preLogIndex == rf.logEntries[0].Idx {
+		preLogTerm = rf.logEntries[0].Term
+	}
+	preLogTerm = rf.logEntries[rf.getRealIndex(preLogIndex)].Term
 	return
 }
 
@@ -109,9 +115,9 @@ func (rf *Raft) getAppendArgs(index int) AppendEntriesArgs {
 func (rf *Raft) updateCommitIndex() {
 	//DPrintf("update commit")
 	hasCommit := false
-	for i := rf.commitIndex + 1; i <= len(rf.logEntries); i++ {
+	for i := rf.commitIndex + 1; i <= rf.logEntries[0].Idx+len(rf.logEntries); i++ {
 		count := 0
-		DPrintf("matchIndex,rf:%d,term:%d,matchIndexs:%v", rf.me, rf.term, rf.matchIndex)
+		//DPrintf("matchIndex,rf:%d,term:%d,matchIndexs:%v", rf.me, rf.term, rf.matchIndex)
 		for _, m := range rf.matchIndex {
 			if m >= i {
 				count += 1
@@ -157,7 +163,7 @@ func (rf *Raft) sendAppendEntries(peerId int) {
 		//重新计时
 		RPCTimer.Reset(RPCTimeout)
 		go func(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
-			DPrintf("rf:%d,term:%d,ready to send arg to %d,args:%v", rf.me, rf.term, peerId, args)
+			//DPrintf("rf:%d,term:%d,ready to send arg to %d,args:%v", rf.me, rf.term, peerId, args)
 			ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 			//DPrintf("reply:%v", reply)
 			if !ok {
@@ -203,10 +209,17 @@ func (rf *Raft) sendAppendEntries(peerId int) {
 			rf.mu.Unlock()
 			return
 		} else {
-			//失败后重新设置NextIndex再发送
-			rf.nextIndex[peerId] = reply.NextIndex
-			rf.mu.Unlock()
-			continue
+			if reply.NextIndex <= rf.logEntries[0].Idx {
+				DPrintf("sendInstallSnapshot,nextIndex%d,snapindex%d", reply.NextIndex, rf.logEntries[0].Idx)
+				go rf.sendInstallSnapshot(peerId)
+				rf.mu.Unlock()
+				return
+			} else {
+				//失败后重新设置NextIndex再发送
+				rf.nextIndex[peerId] = reply.NextIndex
+				rf.mu.Unlock()
+				continue
+			}
 		}
 	}
 }
