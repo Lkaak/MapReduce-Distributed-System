@@ -1,13 +1,18 @@
 package kvraft
 
-import "6.824/labrpc"
+import (
+	"6.824/labrpc"
+	mathrand "math/rand"
+)
 import "crypto/rand"
 import "math/big"
-
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	clientId       int64
+	requestId      int
+	recentLeaderId int
 }
 
 func nrand() int64 {
@@ -21,6 +26,8 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.clientId = nrand()
+	ck.recentLeaderId = mathrand.Intn(len(servers))
 	return ck
 }
 
@@ -39,6 +46,32 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
+	//发起新请求，递增requestId
+	ck.requestId++
+	requestId := ck.requestId
+	server := ck.recentLeaderId
+	for {
+		//初始化请求和回复参数
+		args := GetArgs{
+			Key:       key,
+			ClientId:  ck.clientId,
+			RequestId: requestId,
+		}
+		reply := GetReply{}
+		ok := ck.servers[server].Call("KVServer.Get", &args, &reply)
+		if !ok || reply.Err == ErrWrongLeader {
+			//RPC请求失败或者发送的服务器不是leader，则重新选一个新的服务器发送
+			server = (server + 1) % len(ck.servers)
+			continue
+		} else if reply.Err == ErrNoKey {
+			//如果返回没有对应的key，组返回空值
+			return ""
+		} else if reply.Err == OK {
+			//如果返回ok，则返回回复中的值，并修改recentLeaderId
+			ck.recentLeaderId = server
+			return reply.Value
+		}
+	}
 	return ""
 }
 
@@ -54,6 +87,34 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	//发起新请求，递增请求id
+	ck.requestId++
+	requestId := ck.requestId
+	server := ck.recentLeaderId
+	for {
+
+		args := PutAppendArgs{
+			Key:       key,
+			Value:     value,
+			Op:        op,
+			ClientId:  ck.clientId,
+			RequestId: requestId,
+		}
+		reply := PutAppendReply{}
+		ok := ck.servers[server].Call("KVServer.PutAppend", &args, &reply)
+		if !ok || reply.Err == ErrWrongLeader {
+			server = (server + 1) % len(ck.servers)
+			continue
+		}
+		if reply.Err == OK {
+			ck.recentLeaderId = server
+			return
+		}
+	}
+
+	//如果不是leader则重新请求
+	//如果ok则直接返回，并修改recentLeaderid
+	return
 }
 
 func (ck *Clerk) Put(key string, value string) {

@@ -72,9 +72,9 @@ const (
 
 const (
 	ElectionTimeOut  = time.Millisecond * 300
-	HeartBeatTimeout = time.Millisecond * 150
+	HeartBeatTimeout = time.Millisecond * 27
 	RPCTimeout       = time.Millisecond * 100
-	ApplyInterVal    = time.Millisecond * 100
+	ApplyInterVal    = time.Millisecond * 28
 )
 
 type LogEntry struct {
