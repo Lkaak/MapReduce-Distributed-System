@@ -73,8 +73,10 @@ const (
 const (
 	ElectionTimeOut  = time.Millisecond * 300
 	HeartBeatTimeout = time.Millisecond * 27
-	RPCTimeout       = time.Millisecond * 100
-	ApplyInterVal    = time.Millisecond * 28
+	//HeartBeatTimeout = time.Millisecond * 150
+	RPCTimeout    = time.Millisecond * 100
+	ApplyInterVal = time.Millisecond * 28
+	//ApplyInterVal = time.Millisecond * 100
 )
 
 type LogEntry struct {
@@ -116,6 +118,10 @@ type Raft struct {
 func randElectionTimeout() time.Duration {
 	r := time.Duration(rand.Int63()) % ElectionTimeOut
 	return r + ElectionTimeOut
+}
+
+func (rf *Raft) GetRaftStateSize() int {
+	return rf.persister.RaftStateSize()
 }
 
 // return currentTerm and whether this server

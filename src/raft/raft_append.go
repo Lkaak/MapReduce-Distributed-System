@@ -57,9 +57,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	} else {
 		//不能匹配则返回当前term的第一个index
 		reply.Success = false
-		term := rf.logEntries[args.PrevLogIndex].Term
+		term := rf.logEntries[rf.getRealIndex(args.PrevLogIndex)].Term
 		index := args.PrevLogIndex
-		for index > rf.commitIndex && rf.logEntries[index].Term == term {
+		for index > rf.commitIndex && index > rf.logEntries[0].Idx && rf.logEntries[rf.getRealIndex(index)].Term == term {
 			index -= 1
 		}
 		reply.NextIndex = index + 1

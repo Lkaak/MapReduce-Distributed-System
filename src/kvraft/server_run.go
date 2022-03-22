@@ -23,6 +23,9 @@ func (kv *KVServer) ReadRaftApplyCommand() {
 		if msg.CommandValid {
 			kv.GetCommand(msg)
 		}
+		if msg.SnapshotValid {
+			kv.GetSnapShot(msg)
+		}
 	}
 }
 
@@ -34,7 +37,7 @@ func (kv *KVServer) ExecutePutOnServer(op Op) {
 	//修改lastrequestId
 	kv.lastRequestId[op.ClientId] = op.RequestId
 	kv.mu.Unlock()
-	DPrintf("[ExecutePutOnServer]ClientId:%d,RequestId:%d,key:%v,value:%v", op.ClientId, op.RequestId, op.Key, op.Value)
+	DPrintf("[ExecutePutOnServer]Server:%d,ClientId:%d,RequestId:%d,key:%v,value:%v", kv.me, op.ClientId, op.RequestId, op.Key, op.Value)
 	kv.DprintfData()
 }
 
@@ -54,7 +57,7 @@ func (kv *KVServer) ExecuteAppendOnServer(op Op) {
 	//修改lastrequestId
 	kv.lastRequestId[op.ClientId] = op.RequestId
 	kv.mu.Unlock()
-	DPrintf("[ExecuteAppendOnServer]ClientId:%d,RequestId:%d,key:%v,value:%v", op.ClientId, op.RequestId, op.Key, op.Value)
+	DPrintf("[ExecuteAppendOnServer]Server:%d,ClientId:%d,RequestId:%d,key:%v,value:%v", kv.me, op.ClientId, op.RequestId, op.Key, op.Value)
 	kv.DprintfData()
 }
 
@@ -74,6 +77,9 @@ func (kv *KVServer) GetCommand(msg raft.ApplyMsg) {
 		}
 	}
 	//发送消息给WaitChan通知server可以返回结果
+	if kv.maxraftstate != -1 {
+		kv.CheckForSnapShot(msg.CommandIndex)
+	}
 	kv.SendMessageToWaitChan(op, msg.CommandIndex)
 }
 
@@ -85,7 +91,8 @@ func (kv *KVServer) SendMessageToWaitChan(op Op, index int) {
 	ch, exist := kv.waitApplyCh[index]
 	if exist {
 		ch <- op
-	} //else {
+	}
+	//} else {
 	//	kv.waitApplyCh[index] = make(chan Op, 1)
 	//	kv.waitApplyCh[index] <- op
 	//}

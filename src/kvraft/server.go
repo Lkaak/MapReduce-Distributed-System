@@ -13,7 +13,7 @@ import (
 const (
 	Debug = false
 	//Debug     = true
-	RfTimeOut = 500
+	RfTimeOut = 600
 )
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
@@ -47,6 +47,9 @@ type KVServer struct {
 	data          map[string]string //存储数据
 	waitApplyCh   map[int]chan Op   //等待raft应用后通知给server
 	lastRequestId map[int64]int     //不同客户端上次请求的ID(防止重复请求)
+
+	//snapshot
+	LastIncludedIndex int
 }
 
 func (kv *KVServer) ExecuteGetOnServer(op Op) (string, bool) {
@@ -65,14 +68,14 @@ func (kv *KVServer) ExecuteGetOnServer(op Op) (string, bool) {
 }
 
 func (kv *KVServer) DprintfData() {
-	if !Debug {
-		return
+	if Debug {
+		kv.mu.Lock()
+		defer kv.mu.Unlock()
+		for k, v := range kv.data {
+			DPrintf("[Data]server:%d,key:%v,value:%v", kv.me, k, v)
+		}
 	}
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-	for k, v := range kv.data {
-		DPrintf("[Data]server:%d,key:%v,value:%v", kv.me, k, v)
-	}
+	return
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -174,13 +177,14 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	//分情况执行操作
 	select {
 	case <-time.After(time.Millisecond * RfTimeOut):
-		DPrintf("[PUTAPPEND TIMEOUT]:opClientId:%d,opRequestId:%d,Server:%d,opKey:%v,rfIndex:%v", op.ClientId, op.RequestId, kv.me, op.Key, rfIndex)
+		DPrintf("[PUTAPPEND TIMEOUT]:opType:%v,opClientId:%d,opRequestId:%d,Server:%d,opKey:%v,rfIndex:%v", op.OperationType, op.ClientId, op.RequestId, kv.me, op.Key, rfIndex)
 		if kv.ifRequestRepetition(op.ClientId, op.RequestId) {
 			reply.Err = OK
 		} else {
 			reply.Err = ErrWrongLeader
 		}
 	case rfCommitOp := <-chForWaitCh:
+		DPrintf("[PUTAPPEND Msg From RfWaitChan]:opType:%v,opClientId:%d,opRequestId:%d,Server:%d,opKey:%v,opValue:%v,rfIndex:%v", op.OperationType, op.ClientId, op.RequestId, kv.me, op.Key, op.Value, rfIndex)
 		if rfCommitOp.ClientId == op.ClientId && rfCommitOp.RequestId == op.RequestId {
 			reply.Err = OK
 		} else {
@@ -246,6 +250,12 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.data = make(map[string]string)
 	kv.waitApplyCh = make(map[int]chan Op)
 	kv.lastRequestId = make(map[int64]int)
+
+	//snapshot
+	snapshot := persister.ReadSnapshot()
+	if len(snapshot) > 0 {
+		kv.ReadSnapShotToApply(snapshot)
+	}
 
 	go kv.ReadRaftApplyCommand()
 	return kv
