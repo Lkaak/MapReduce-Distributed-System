@@ -108,8 +108,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	//分情况执行get操作
 	select {
 	case <-time.After(time.Millisecond * RfTimeOut):
-		//如果超时了则看是否是重复操作且还是不是leader
-		//之所以需要看是重复的才执行,因为重复则说明当前对该请求已经被执行
+		//重复则说明当前对该请求已经被执行
 		DPrintf("[GET TIMEOUT]:opClientId:%d,opRequestId:%d,Server:%d,opKey:%v,rfIndex:%v", op.ClientId, op.RequestId, kv.me, op.Key, rfIndex)
 		//_, ifLeader := kv.rf.GetState()
 		if kv.ifRequestRepetition(op.ClientId, op.RequestId) {
