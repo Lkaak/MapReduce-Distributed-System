@@ -4,6 +4,11 @@ import (
 	"6.824/raft"
 )
 
+const (
+	numerator   = 9
+	denominator = 10
+)
+
 func (kv *KVServer) ifRequestRepetition(nclientId int64, nrequestId int) bool {
 	//读数据之前进行上锁
 	kv.mu.Lock()
@@ -78,7 +83,7 @@ func (kv *KVServer) GetCommand(msg raft.ApplyMsg) {
 	}
 	//发送消息给WaitChan通知server可以返回结果
 	if kv.maxraftstate != -1 {
-		kv.CheckForSnapShot(msg.CommandIndex)
+		kv.CheckForSnapShot(msg.CommandIndex, numerator, denominator)
 	}
 	kv.SendMessageToWaitChan(op, msg.CommandIndex)
 }

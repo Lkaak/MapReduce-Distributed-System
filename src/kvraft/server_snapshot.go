@@ -34,9 +34,9 @@ func (kv *KVServer) GetSnapShot(msg raft.ApplyMsg) {
 	}
 }
 
-func (kv *KVServer) CheckForSnapShot(rfIndex int) {
+func (kv *KVServer) CheckForSnapShot(rfIndex, numerator, denominator int) {
 
-	if kv.rf.GetRaftStateSize() > (kv.maxraftstate * 9 / 10) {
+	if kv.rf.GetRaftStateSize() > (kv.maxraftstate * numerator / denominator) {
 		snapshot := kv.MakeSnapShot()
 		kv.rf.Snapshot(rfIndex, snapshot)
 	}

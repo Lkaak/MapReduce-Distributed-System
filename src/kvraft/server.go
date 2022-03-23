@@ -109,11 +109,10 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	select {
 	case <-time.After(time.Millisecond * RfTimeOut):
 		//如果超时了则看是否是重复操作且还是不是leader
-		//之所以需要看是重复的才执行，因为可能第一次没成功第二次才成功
-		//如果两次都超时了，那么需要对其作出响应，防止无限请求
+		//之所以需要看是重复的才执行,因为重复则说明当前对该请求已经被执行
 		DPrintf("[GET TIMEOUT]:opClientId:%d,opRequestId:%d,Server:%d,opKey:%v,rfIndex:%v", op.ClientId, op.RequestId, kv.me, op.Key, rfIndex)
-		_, ifLeader := kv.rf.GetState()
-		if kv.ifRequestRepetition(op.ClientId, op.RequestId) && ifLeader {
+		//_, ifLeader := kv.rf.GetState()
+		if kv.ifRequestRepetition(op.ClientId, op.RequestId) {
 			value, exist := kv.ExecuteGetOnServer(op)
 			if exist {
 				reply.Err = OK
@@ -177,7 +176,9 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	//分情况执行操作
 	select {
 	case <-time.After(time.Millisecond * RfTimeOut):
+		//_, ifLeader := kv.rf.GetState()
 		DPrintf("[PUTAPPEND TIMEOUT]:opType:%v,opClientId:%d,opRequestId:%d,Server:%d,opKey:%v,rfIndex:%v", op.OperationType, op.ClientId, op.RequestId, kv.me, op.Key, rfIndex)
+		//检测是不是重复请求，看是不是操作已经执行了
 		if kv.ifRequestRepetition(op.ClientId, op.RequestId) {
 			reply.Err = OK
 		} else {
