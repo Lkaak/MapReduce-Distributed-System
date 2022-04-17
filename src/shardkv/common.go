@@ -1,7 +1,5 @@
 package shardkv
 
-import "log"
-
 //
 // Sharded key/value server.
 // Lots of replica groups, each running Raft.
@@ -16,14 +14,25 @@ const (
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongGroup  = "ErrWrongGroup"
 	ErrWrongLeader = "ErrWrongLeader"
+	ErrConfigNum   = "ErrConfigNum"
 )
+
+type ShardComponent struct {
+	ShardIndex      int
+	KVDBOfShard     map[string]string
+	ClientRequestId map[int64]int
+}
 
 type Err string
 
-type ShardComponent struct {
-	ShardIndex    int               //分片下标
-	ShardData     map[string]string //改分片的数据
-	LastRequestId map[int64]int     //请求该分片的客户端信息，防止重复请求
+type MigrateShardArgs struct {
+	MigrateData []ShardComponent
+	ConfigNum   int
+}
+
+type MigrateShardReply struct {
+	Err       Err
+	ConfigNum int
 }
 
 // Put or Append
@@ -55,19 +64,4 @@ type GetArgs struct {
 type GetReply struct {
 	Err   Err
 	Value string
-}
-
-type MigrateShardArgs struct {
-	ConfigNum   int
-	MigrateData []ShardComponent
-}
-type MigrateShardReply struct {
-	Err Err
-}
-
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug {
-		log.Printf(format, a...)
-	}
-	return
 }

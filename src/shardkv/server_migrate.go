@@ -4,25 +4,23 @@ import (
 	"time"
 )
 
-func (kv *ShardKV) GetNewConfig() {
-	for {
+func (kv *ShardKV) PullNewConfigLoop() {
+	for !kv.killed() {
 		kv.mu.Lock()
-		//获取当前配置的信息
-		oldConfigNum := kv.config.Num
+		lastConfigNun := kv.config.Num
 		_, ifLeader := kv.rf.GetState()
 		kv.mu.Unlock()
-		//由leader发起更新新配置的信息，因此不是leader不能处理
+
 		if !ifLeader {
 			time.Sleep(CONFIGCHECK_TIMEOUT * time.Millisecond)
 			continue
 		}
-		//查询是否有当前配置的下一个的新配置消息
-		newConfig := kv.mck.Query(oldConfigNum + 1)
-		//如果有则给raft存储
-		if newConfig.Num == oldConfigNum+1 {
+
+		newestConfig := kv.mck.Query(lastConfigNun + 1)
+		if newestConfig.Num == lastConfigNun+1 {
 			op := Op{
-				OperationType: NEWCONFIG,
-				NewConfig:     newConfig,
+				Operation:        NEWCONFIG,
+				Config_NewConfig: newestConfig,
 			}
 			kv.mu.Lock()
 			if _, ifLeader := kv.rf.GetState(); ifLeader {
@@ -34,42 +32,40 @@ func (kv *ShardKV) GetNewConfig() {
 	}
 }
 
-func (kv *ShardKV) SendShardToOtherGroup() {
-	//
-	for {
+func (kv *ShardKV) SendShardToOtherGroupLoop() {
+	for !kv.killed() {
 		kv.mu.Lock()
 		_, ifLeader := kv.rf.GetState()
 		kv.mu.Unlock()
+
 		if !ifLeader {
 			time.Sleep(SENDSHARDS_TIMEOUT * time.Millisecond)
 			continue
 		}
-		//检查需不需要迁移数据（接受或者发送）
-		migrateFlag := true
+
+		noMigrating := true
 		kv.mu.Lock()
-		for shard := 0; shard < Nshards; shard++ {
+		for shard := 0; shard < NShards; shard++ {
 			if kv.migratingShard[shard] {
-				migrateFlag = false
+				noMigrating = false
 			}
 		}
 		kv.mu.Unlock()
-		//如不需要则休眠一段时间再重新调用
-		if migrateFlag {
+		if noMigrating {
 			time.Sleep(SENDSHARDS_TIMEOUT * time.Millisecond)
 			continue
 		}
-		//检查需不需要发送数据
+
 		ifNeedSend, sendData := kv.ifHaveSendData()
-		//不需要发送则直接休息并重新调用
 		if !ifNeedSend {
 			time.Sleep(SENDSHARDS_TIMEOUT * time.Millisecond)
 			continue
 		}
-		//发送数据
 		kv.sendShardComponent(sendData)
 		time.Sleep(SENDSHARDS_TIMEOUT * time.Millisecond)
 	}
 }
+
 func (kv *ShardKV) ifHaveSendData() (bool, map[int][]ShardComponent) {
 	sendData := kv.MakeSendShardComponent()
 	if len(sendData) == 0 {
@@ -77,16 +73,68 @@ func (kv *ShardKV) ifHaveSendData() (bool, map[int][]ShardComponent) {
 	}
 	return true, sendData
 }
+func (kv *ShardKV) MakeSendShardComponent() map[int][]ShardComponent {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	sendData := make(map[int][]ShardComponent)
+	for shard := 0; shard < NShards; shard++ {
+		nowOwner := kv.config.Shards[shard]
+		if kv.migratingShard[shard] && kv.gid != nowOwner {
+			tempComponent := ShardComponent{
+				ShardIndex:      shard,
+				KVDBOfShard:     make(map[string]string),
+				ClientRequestId: make(map[int64]int),
+			}
+			CloneSecondComponentIntoFirstExceptShardIndex(&tempComponent, kv.kvDB[shard])
+			sendData[nowOwner] = append(sendData[nowOwner], tempComponent)
+		}
+	}
+	return sendData
+}
+
 func (kv *ShardKV) sendShardComponent(sendData map[int][]ShardComponent) {
-	for gid, shardComponent := range sendData {
+	for aimGid, ShardComponents := range sendData {
 		kv.mu.Lock()
 		args := &MigrateShardArgs{
+			MigrateData: make([]ShardComponent, 0),
 			ConfigNum:   kv.config.Num,
-			MigrateData: shardComponent,
 		}
-		groupServers := kv.config.Groups[gid]
+		groupServers := kv.config.Groups[aimGid]
 		kv.mu.Unlock()
+		for _, components := range ShardComponents {
+			tempComponent := ShardComponent{
+				ShardIndex:      components.ShardIndex,
+				KVDBOfShard:     make(map[string]string),
+				ClientRequestId: make(map[int64]int),
+			}
+			CloneSecondComponentIntoFirstExceptShardIndex(&tempComponent, components)
+			args.MigrateData = append(args.MigrateData, tempComponent)
+		}
 		go kv.callMigrateRPC(groupServers, args)
+	}
+}
+
+func (kv *ShardKV) callMigrateRPC(groupServers []string, args *MigrateShardArgs) {
+	for _, groupMember := range groupServers {
+		callEnd := kv.make_end(groupMember)
+		reply := MigrateShardReply{}
+		ok := callEnd.Call("ShardKV.MigrateShard", args, &reply)
+		kv.mu.Lock()
+		myconfigNum := kv.config.Num
+		kv.mu.Unlock()
+		if ok && reply.Err == OK {
+			//检查是不是过时操作或者已经迁移完成了
+			if myconfigNum != args.ConfigNum || kv.CheckMigrateState(args.MigrateData) {
+				return
+			} else {
+				kv.rf.Start(Op{
+					Operation:           MIGRATESHARD,
+					MigrateData_MIGRATE: args.MigrateData,
+					ConfigNum_MIGRATE:   args.ConfigNum,
+				})
+				return
+			}
+		}
 	}
 }
 
@@ -94,102 +142,72 @@ func (kv *ShardKV) MigrateShard(args *MigrateShardArgs, reply *MigrateShardReply
 	kv.mu.Lock()
 	myConfigNum := kv.config.Num
 	kv.mu.Unlock()
-	//自己这边没有更新到最新的config，则直接返回等待自己为最新的才执行
+	//比自己的大，则需要等自己更新到最新的config
 	if args.ConfigNum > myConfigNum {
+		reply.Err = ErrConfigNum
+		reply.ConfigNum = myConfigNum
 		return
 	}
-	//第一次成功接收并且执行但回复失败，那边重新发送，则需要返回ok让那边同步
+	//比自己小，可能对面以前的回复丢失了
 	if args.ConfigNum < myConfigNum {
 		reply.Err = OK
 		return
 	}
-	//检测是不是自己已经修改了
-	if kv.checkMigrateState(args.MigrateData) {
+	//相等的config，但是回复丢失，自己更新了对方没有
+	if kv.CheckMigrateState(args.MigrateData) {
 		reply.Err = OK
 		return
 	}
 	op := Op{
-		OperationType:    MIGRATE,
-		MigrateData:      args.MigrateData,
-		MigrateConfigNum: args.ConfigNum,
+		Operation:           MIGRATESHARD,
+		MigrateData_MIGRATE: args.MigrateData,
+		ConfigNum_MIGRATE:   args.ConfigNum,
 	}
-	rfIndex, _, _ := kv.rf.Start(op)
-	//DPrintf("[[Get StartToRf],Server:%d,OpType:%v,OpClientId:%d,OpRequestId:%d,OpKey:%v,OpValue:%v", kv.me, op.OperationType, op.ClientId, op.RequestId, op.Key, op.Value)
-	//检查waitApplyCh是否存在
+	raftIndex, _, _ := kv.rf.Start(op)
+
 	kv.mu.Lock()
-	chForWaitCh, exist := kv.waitApplyCh[rfIndex]
+	chForRaftIndex, exist := kv.waitApplyCh[raftIndex]
 	if !exist {
-		kv.waitApplyCh[rfIndex] = make(chan Op, 1)
-		chForWaitCh = kv.waitApplyCh[rfIndex]
+		kv.waitApplyCh[raftIndex] = make(chan Op, 1)
+		chForRaftIndex = kv.waitApplyCh[raftIndex]
 	}
 	kv.mu.Unlock()
-
 	select {
-	case <-time.After(time.Millisecond * RfTimeOut):
-		if kv.checkMigrateState(args.MigrateData) {
+	case <-time.After(time.Millisecond * CONSENSUS_TIMEOUT):
+		kv.mu.Lock()
+		_, ifLeader := kv.rf.GetState()
+		tempConfig := kv.config.Num
+		kv.mu.Unlock()
+		//检查是不是已经提交了而且仍然是leader
+		if args.ConfigNum <= tempConfig && kv.CheckMigrateState(args.MigrateData) && ifLeader {
+			reply.ConfigNum = tempConfig
 			reply.Err = OK
 		} else {
 			reply.Err = ErrWrongLeader
 		}
-	case rfCommitOp := <-chForWaitCh:
-		if rfCommitOp.MigrateConfigNum == args.ConfigNum && kv.checkMigrateState(args.MigrateData) {
+	case raftCommitOp := <-chForRaftIndex:
+		kv.mu.Lock()
+		tempConfig := kv.config.Num
+		kv.mu.Unlock()
+		//检查是不是发送的命令，且是不是自己已有的config，以及是不是已经完成了应用
+		if raftCommitOp.ConfigNum_MIGRATE == args.ConfigNum && args.ConfigNum <= tempConfig && kv.CheckMigrateState(args.MigrateData) {
+			reply.ConfigNum = tempConfig
 			reply.Err = OK
 		} else {
 			reply.Err = ErrWrongLeader
 		}
 	}
 	kv.mu.Lock()
-	delete(kv.waitApplyCh, rfIndex)
+	delete(kv.waitApplyCh, raftIndex)
 	kv.mu.Unlock()
 	return
 }
 
-func (kv *ShardKV) callMigrateRPC(groupServers []string, args *MigrateShardArgs) {
-	for _, groupMember := range groupServers {
-		srv := kv.make_end(groupMember)
-		reply := MigrateShardReply{}
-		ok := srv.Call("ShardKV.MigrateShard", args, &reply)
-		if ok && reply.Err == OK {
-			//检查是不是已经修改了状态
-			if kv.checkMigrateState(args.MigrateData) {
-				return
-			} else {
-				kv.rf.Start(Op{
-					OperationType:    MIGRATE,
-					MigrateData:      args.MigrateData,
-					MigrateConfigNum: args.ConfigNum,
-				})
-			}
-		}
-		//not ok，则可能网络不通或者对面config不够新所以先不执行,等待下一次
-	}
-}
-
-func (kv *ShardKV) MakeSendShardComponent() map[int][]ShardComponent {
+func (kv *ShardKV) CheckMigrateState(shardComponents []ShardComponent) bool {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	sendData := make(map[int][]ShardComponent)
-	for shard := 0; shard < Nshards; shard++ {
-		nowOwner := kv.config.Shards[shard]
-		//如果上了锁且新的config中该shard对应的不是自己的gid，则说明需要发送
-		if kv.migratingShard[shard] && kv.gid != nowOwner {
-			tempComponent := ShardComponent{
-				ShardIndex:    shard,
-				ShardData:     make(map[string]string),
-				LastRequestId: make(map[int64]int),
-			}
-			CloneComponentData(&tempComponent, kv.data[shard])
-			sendData[nowOwner] = append(sendData[nowOwner], tempComponent)
-		}
-	}
-	return sendData
-}
-
-func (kv *ShardKV) checkMigrateState(shardComponent []ShardComponent) bool {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-	for _, component := range shardComponent {
-		if kv.migratingShard[component.ShardIndex] {
+	for _, shdata := range shardComponents {
+		if kv.migratingShard[shdata.ShardIndex] {
 			return false
 		}
 	}

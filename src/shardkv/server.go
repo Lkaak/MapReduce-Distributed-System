@@ -1,40 +1,40 @@
 package shardkv
 
 import (
+	"6.824/labgob"
 	"6.824/labrpc"
+	"6.824/raft"
 	"6.824/shardctrler"
+	"sync"
+	"sync/atomic"
 	"time"
 )
-import "6.824/raft"
-import "sync"
-import "6.824/labgob"
 
 const (
-	Debug = false
-	//Debug               = true
-	Nshards             = shardctrler.NShards
-	PUT                 = "put"
-	GET                 = "get"
-	APPEND              = "append"
-	MIGRATE             = "migrate"
-	NEWCONFIG           = "newConfig"
-	CONFIGCHECK_TIMEOUT = 90
-	RfTimeOut           = 600
-	SENDSHARDS_TIMEOUT  = 150
+	CONSENSUS_TIMEOUT   = 500 //共识时间
+	CONFIGCHECK_TIMEOUT = 90  //询问shardctrler的间隔
+	SENDSHARDS_TIMEOUT  = 150 //发送分片轮询间隔
+	NShards             = shardctrler.NShards
+
+	GET          = "get"
+	PUT          = "put"
+	APPEND       = "append"
+	MIGRATESHARD = "migrate"
+	NEWCONFIG    = "newconfig"
 )
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	OperationType    string //操作类型，put.get,append
-	Key              string
-	Value            string
-	ClientId         int64
-	RequestId        int
-	NewConfig        shardctrler.Config //新的config信息
-	MigrateData      []ShardComponent   //需要更新的数据
-	MigrateConfigNum int                //更新的配置编号
+	Operation           string
+	Key                 string
+	Value               string
+	ClientId            int64
+	RequestId           int
+	Config_NewConfig    shardctrler.Config
+	MigrateData_MIGRATE []ShardComponent
+	ConfigNum_MIGRATE   int
 }
 
 type ShardKV struct {
@@ -46,78 +46,66 @@ type ShardKV struct {
 	gid          int
 	ctrlers      []*labrpc.ClientEnd
 	maxraftstate int // snapshot if log grows this big
-
+	dead         int32
 	// Your definitions here.
-	mck               *shardctrler.Clerk //询问最新的配置
-	data              []ShardComponent
-	waitApplyCh       map[int]chan Op    //等待raft应用后通知给server
-	LastIncludedIndex int                //snapshot最新下标
-	config            shardctrler.Config //存储读取的最新的config
-	migratingShard    [Nshards]bool      //更替数据时对相应的shard进行上锁
+	mck         *shardctrler.Clerk
+	kvDB        []ShardComponent
+	waitApplyCh map[int]chan Op
+
+	lastSSPointRaftLogIndex int
+	config                  shardctrler.Config //当前的config
+	migratingShard          [NShards]bool
 }
 
-func (kv *ShardKV) DprintfData() {
-	if Debug {
-		kv.mu.Lock()
-		defer kv.mu.Unlock()
-		DPrintf("[==DataInFo==]server:%d,gid:%d,migrate:%v,data:%v,shard:%v", kv.me, kv.gid, kv.migratingShard, kv.data, kv.config.Shards)
-	}
-	return
-}
-
-func (kv *ShardKV) CheckShardState(configNum, shardIndex int) (bool, bool) {
+//是否改组负责该分片，是否可以（不在迁移状态）
+func (kv *ShardKV) CheckShardState(clientNum int, shardIndex int) (bool, bool) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	return kv.config.Num == configNum && kv.config.Shards[shardIndex] == kv.gid, !kv.migratingShard[shardIndex]
+	return kv.config.Num == clientNum && kv.config.Shards[shardIndex] == kv.gid, !kv.migratingShard[shardIndex]
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	_, isLeader := kv.rf.GetState()
-	if !isLeader {
+	_, ifLeader := kv.rf.GetState()
+	if !ifLeader {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	//检测config是不是一致和是不是正在迁移不能执行get
 	shardIndex := key2shard(args.Key)
-	ifConfig, ifLock := kv.CheckShardState(args.ConfigNum, shardIndex)
-	//是不是同一个config且拥有对应的数据
-	if !ifConfig {
+	ifRespons, ifAvail := kv.CheckShardState(args.ConfigNum, shardIndex)
+	if !ifRespons {
 		reply.Err = ErrWrongGroup
 		return
 	}
-	//是不是正在迁移对应的数据
-	if !ifLock {
+	if !ifAvail {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	//执行op
+
 	op := Op{
-		OperationType: GET,
-		Key:           args.Key,
-		Value:         "",
-		ClientId:      args.ClientId,
-		RequestId:     args.RequestId,
+		Operation: GET,
+		Key:       args.Key,
+		Value:     "",
+		ClientId:  args.ClientId,
+		RequestId: args.RequestId,
 	}
-	rfIndex, _, _ := kv.rf.Start(op)
-	//DPrintf("[[Get StartToRf],Server:%d,OpType:%v,OpClientId:%d,OpRequestId:%d,OpKey:%v,OpValue:%v", kv.me, op.OperationType, op.ClientId, op.RequestId, op.Key, op.Value)
-	//检查waitApplyCh是否存在
+
+	raftIndex, _, _ := kv.rf.Start(op)
 	kv.mu.Lock()
-	chForWaitCh, exist := kv.waitApplyCh[rfIndex]
+	chForRaftIndex, exist := kv.waitApplyCh[raftIndex]
 	if !exist {
-		kv.waitApplyCh[rfIndex] = make(chan Op, 1)
-		chForWaitCh = kv.waitApplyCh[rfIndex]
+		kv.waitApplyCh[raftIndex] = make(chan Op, 1)
+		chForRaftIndex = kv.waitApplyCh[raftIndex]
 	}
 	kv.mu.Unlock()
 
 	select {
-	case <-time.After(time.Millisecond * RfTimeOut):
-		//重复则说明当前对该请求已经被执行
-		//DPrintf("[GET TIMEOUT]:opClientId:%d,opRequestId:%d,Server:%d,opKey:%v,rfIndex:%v", op.ClientId, op.RequestId, kv.me, op.Key, rfIndex)
-		//_, ifLeader := kv.rf.GetState()
-		if kv.ifRequestRepetition(op.ClientId, op.RequestId, key2shard(op.Key)) {
-			value, exist := kv.ExecuteGetOnServer(op)
-			if exist {
+	case <-time.After(CONSENSUS_TIMEOUT * time.Millisecond):
+		_, isLeader := kv.rf.GetState()
+		//检查是不是已经提交
+		if kv.ifRequestDuplicate(op.ClientId, op.RequestId, key2shard(op.Key)) && isLeader {
+			value, exists := kv.ExecuteGetOnKVDB(op)
+			if exists {
 				reply.Err = OK
 				reply.Value = value
 			} else {
@@ -127,12 +115,10 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		} else {
 			reply.Err = ErrWrongLeader
 		}
-	case rfCommitOp := <-chForWaitCh:
-		//检查是不是对应的op
-		//DPrintf("[GET Msg From RfWaitChan]:opClientId:%d,opRequestId:%d,Server:%d,opKey:%v,opValue:%v,rfIndex:%v", op.ClientId, op.RequestId, kv.me, op.Key, op.Value, rfIndex)
-		if rfCommitOp.ClientId == op.ClientId && rfCommitOp.RequestId == op.RequestId {
-			value, exist := kv.ExecuteGetOnServer(op)
-			if exist {
+	case raftCommitOp := <-chForRaftIndex:
+		if raftCommitOp.ClientId == op.ClientId && raftCommitOp.RequestId == op.RequestId {
+			value, exists := kv.ExecuteGetOnKVDB(op)
+			if exists {
 				reply.Err = OK
 				reply.Value = value
 			} else {
@@ -144,70 +130,65 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		}
 	}
 	kv.mu.Lock()
-	delete(kv.waitApplyCh, rfIndex)
+	delete(kv.waitApplyCh, raftIndex)
 	kv.mu.Unlock()
 	return
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	_, isLeader := kv.rf.GetState()
-	if !isLeader {
+	_, ifLeader := kv.rf.GetState()
+	if !ifLeader {
 		reply.Err = ErrWrongLeader
 		return
 	}
+
 	shardIndex := key2shard(args.Key)
-	ifConfig, ifLock := kv.CheckShardState(args.ConfigNum, shardIndex)
-	//是不是同一个config且拥有对应的数据
-	if !ifConfig {
+	ifRespons, ifAvali := kv.CheckShardState(args.ConfigNum, shardIndex)
+	if !ifRespons {
 		reply.Err = ErrWrongGroup
 		return
 	}
-	//是不是正在迁移对应的数据
-	if !ifLock {
+	if !ifAvali {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	//生产put和Appned的指令准备发给rf
+
 	op := Op{
-		OperationType: args.Op,
-		Key:           args.Key,
-		Value:         args.Value,
-		ClientId:      args.ClientId,
-		RequestId:     args.RequestId,
+		Operation: args.Op,
+		Key:       args.Key,
+		Value:     args.Value,
+		ClientId:  args.ClientId,
+		RequestId: args.RequestId,
 	}
-	//发送给rf
-	rfIndex, _, _ := kv.rf.Start(op)
-	//DPrintf("[[PUTAPPEND StartToRf],Server:%d,OpType:%v,OpClientId:%d,OpRequestId:%d,OpKey:%v,OpValue:%v", kv.me, op.OperationType, op.ClientId, op.RequestId, op.Key, op.Value)
-	//检查waitApplyCh是否存在
+
+	raftIndex, _, _ := kv.rf.Start(op)
+
 	kv.mu.Lock()
-	chForWaitCh, exist := kv.waitApplyCh[rfIndex]
+	chForRaftIndex, exist := kv.waitApplyCh[raftIndex]
 	if !exist {
-		kv.waitApplyCh[rfIndex] = make(chan Op, 1)
-		chForWaitCh = kv.waitApplyCh[rfIndex]
+		kv.waitApplyCh[raftIndex] = make(chan Op, 1)
+		chForRaftIndex = kv.waitApplyCh[raftIndex]
 	}
 	kv.mu.Unlock()
-	//分情况执行操作
+
 	select {
-	case <-time.After(time.Millisecond * RfTimeOut):
-		//_, ifLeader := kv.rf.GetState()
-		//DPrintf("[PUTAPPEND TIMEOUT]:opType:%v,opClientId:%d,opRequestId:%d,Server:%d,opKey:%v,rfIndex:%v", op.OperationType, op.ClientId, op.RequestId, kv.me, op.Key, rfIndex)
-		//检测是不是重复请求，看是不是操作已经执行了
-		if kv.ifRequestRepetition(op.ClientId, op.RequestId, key2shard(op.Key)) {
+	case <-time.After(CONSENSUS_TIMEOUT * time.Millisecond):
+		//超时的put/append请求，即使不是leader只要已经执行过就可以返回ok
+		if kv.ifRequestDuplicate(op.ClientId, op.RequestId, key2shard(op.Key)) {
 			reply.Err = OK
 		} else {
 			reply.Err = ErrWrongLeader
 		}
-	case rfCommitOp := <-chForWaitCh:
-		//DPrintf("[PUTAPPEND Msg From RfWaitChan]:opType:%v,opClientId:%d,opRequestId:%d,Server:%d,opKey:%v,opValue:%v,rfIndex:%v", op.OperationType, op.ClientId, op.RequestId, kv.me, op.Key, op.Value, rfIndex)
-		if rfCommitOp.ClientId == op.ClientId && rfCommitOp.RequestId == op.RequestId {
+	case raftCommitOp := <-chForRaftIndex:
+		if raftCommitOp.ClientId == op.ClientId && raftCommitOp.RequestId == op.RequestId {
 			reply.Err = OK
 		} else {
 			reply.Err = ErrWrongLeader
 		}
 	}
 	kv.mu.Lock()
-	delete(kv.waitApplyCh, rfIndex)
+	delete(kv.waitApplyCh, raftIndex)
 	kv.mu.Unlock()
 	return
 }
@@ -219,8 +200,15 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 // turn off debug output from this instance.
 //
 func (kv *ShardKV) Kill() {
+	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
 	// Your code here, if desired.
+}
+
+//是否终止循环，在循环前判断，可以加快完成速度
+func (kv *ShardKV) killed() bool {
+	z := atomic.LoadInt32(&kv.dead)
+	return z == 1
 }
 
 //
@@ -251,6 +239,7 @@ func (kv *ShardKV) Kill() {
 // StartServer() must return quickly, so it should start goroutines
 // for any long-running work.
 //
+
 func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int, gid int, ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *ShardKV {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
@@ -262,27 +251,29 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.make_end = make_end
 	kv.gid = gid
 	kv.ctrlers = ctrlers
+
 	// Your initialization code here.
-	kv.data = make([]ShardComponent, Nshards)
-	for shard := 0; shard < Nshards; shard++ {
-		kv.data[shard] = ShardComponent{
-			ShardIndex:    shard,
-			ShardData:     make(map[string]string),
-			LastRequestId: make(map[int64]int),
+	kv.kvDB = make([]ShardComponent, NShards)
+	for shard := 0; shard < NShards; shard++ {
+		kv.kvDB[shard] = ShardComponent{
+			ShardIndex:      shard,
+			KVDBOfShard:     make(map[string]string),
+			ClientRequestId: make(map[int64]int),
 		}
 	}
 	kv.mck = shardctrler.MakeClerk(kv.ctrlers)
 	kv.waitApplyCh = make(map[int]chan Op)
-	// Use something like this to talk to the shardctrler:
-	// kv.mck = shardctrler.MakeClerk(kv.ctrlers)
 	snapshot := persister.ReadSnapshot()
 	if len(snapshot) > 0 {
-		kv.ReadSnapShotToApply(snapshot)
+		kv.ReadSnapShotToInstall(snapshot)
 	}
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-	go kv.ReadRaftApplyCommand()
-	go kv.GetNewConfig()
-	go kv.SendShardToOtherGroup()
+	// Use something like this to talk to the shardctrler:
+	// kv.mck = shardctrler.MakeClerk(kv.ctrlers)
+
+	go kv.ReadRaftApplyCommandLoop()
+	go kv.PullNewConfigLoop()
+	go kv.SendShardToOtherGroupLoop()
 	return kv
 }

@@ -1,10 +1,10 @@
 package raft
 
 import (
+	"math/rand"
 	"time"
 )
 
-//RPC参数一定要大写
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	Term         int
@@ -14,7 +14,6 @@ type RequestVoteArgs struct {
 }
 
 type RequestVoteReply struct {
-	// Your data here (2A).
 	Term        int
 	VoteGranted bool
 }
@@ -22,150 +21,117 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
-
 	defer rf.mu.Unlock()
-	defer func() {
-		DPrintf("%d receive Request args:%+v, reply:%+v", rf.me, args, reply)
-	}()
+	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
-	reply.Term = rf.term
-	if rf.term > args.Term {
-		//请求人term小于自身则直接返回false
+	if args.Term < rf.currentTerm {
 		return
-	} else if args.Term == rf.term {
-		if rf.role == Leader {
-			//自己就是leader则直接返回false
-			return
-		} else if rf.votedFor != -1 && rf.votedFor != args.CandidateId {
-			//已经给其他人投票返回false
-			return
-			//没有投票需要在下面检查是否满足条件再决定是否投票
-		}
 	}
-	//
-	if args.Term > rf.term {
-		//收到的Term大于自身的则先进行自我更新
-		rf.term = args.Term
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.currentState = FOLLOWER
 		rf.votedFor = -1
+		reply.Term = rf.currentTerm
 		rf.persist()
-		rf.changeRole(Follower)
 	}
-	//检查是否满足投票结果
-	lastLogTerm, lastLogIndex := rf.lastLogTermIndex()
-	if lastLogTerm > args.LastLogTerm || (lastLogTerm == args.LastLogTerm && lastLogIndex > args.LastLogIndex) {
-		return
+	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+		//检测竞选者是不是比自己的日志要新
+		if args.LastLogTerm < rf.getLastTerm() || (args.LastLogTerm == rf.getLastTerm() && args.LastLogIndex < rf.getLastIndex()) {
+			return
+		}
+		rf.votedFor = args.CandidateId
+		reply.VoteGranted = true
+		rf.persist()
+		rf.resetElectionTimer()
 	}
-	//满足所有条件且没有投过票
-	rf.term = args.Term
-	rf.votedFor = args.CandidateId
-	rf.changeRole(Follower)
-	reply.VoteGranted = true
-	rf.persist()
-	rf.resetElectionTimer()
-	return
 }
 
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) {
-	//如果发送失败需要重新发送，直到成功，但每次失败之间都需要sleep
-	//设置这次rpc最长时间，在该时间内可以多次请求，直到成功
-	rpcTimer := time.NewTimer(RPCTimeout)
-	defer rpcTimer.Stop()
-	for !rf.killed() {
-		rpcTimer.Stop()
-		rpcTimer.Reset(RPCTimeout)
-		ch := make(chan bool, 1) //用于通知结果
-		go func(args *RequestVoteArgs, reply *RequestVoteReply) {
-			ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-			if ok == false {
-				time.Sleep(time.Millisecond * 10)
-			}
-			ch <- ok
-		}(args, reply)
-		select {
-		case <-rpcTimer.C:
-			return
-		case ok := <-ch:
-			if !ok {
-				continue
-			} else {
-				return
-			}
-		}
+func (rf *Raft) electionTicker() {
+	for rf.killed() == false {
+		<-rf.electionTimer.C
+		go rf.startElection()
+		rf.resetElectionTimer()
 	}
 }
 
 func (rf *Raft) startElection() {
 	rf.mu.Lock()
-	//重置计时器
-	rf.electionTimer.Reset(randElectionTimeout())
-	//如果自己就是leader则不需要重新选举
-	if rf.role == Leader {
-		rf.mu.Unlock()
-		return
-	}
-	//进入candidate状态
-	rf.changeRole(Candidate)
-	//获取自己当前的最新log和term号，准备发送RequestVote
-	lastLogTerm, lastLogIndex := rf.lastLogTermIndex()
-	args := RequestVoteArgs{
-		Term:         rf.term,
-		CandidateId:  rf.me,
-		LastLogIndex: lastLogIndex,
-		LastLogTerm:  lastLogTerm,
-	}
-	rf.persist()
-	rf.mu.Unlock()
-	//发送request并统计结果
-	grantVotes := 1                           //获取票数
-	resNum := 1                               //收到的结果数
-	votesCh := make(chan bool, len(rf.peers)) //接收返回的结果
-	//多线程发送请求
-	for index, _ := range rf.peers {
-		if index == rf.me {
-			//自己就不用发送了
-			continue
+	defer rf.mu.Unlock()
+	if rf.currentState != LEADER {
+		rf.currentState = CANDIDATE
+		rf.votedFor = rf.me
+		rf.currentTerm++
+		rf.persist()
+		//DPrintf("[StartElection] Server:%d In term:%d try to elect", rf.me, rf.currentTerm)
+		rf.grantVotes = 1
+		args := RequestVoteArgs{
+			Term:         rf.currentTerm,
+			CandidateId:  rf.me,
+			LastLogIndex: rf.getLastIndex(),
+			LastLogTerm:  rf.getLastTerm(),
 		}
-		//给每个peers发送request请求
-		go func(votesCh chan bool, index int) {
-			reply := RequestVoteReply{}
-			rf.sendRequestVote(index, &args, &reply)
-			votesCh <- reply.VoteGranted
-			//检测返回结果的term大小
-			if reply.Term > rf.term {
-				rf.mu.Lock()
-				rf.term = reply.Term
-				rf.changeRole(Follower)
-				rf.resetElectionTimer()
-				rf.persist()
-				rf.mu.Unlock()
+		for server := range rf.peers {
+			if server == rf.me {
+				continue
 			}
-		}(votesCh, index)
-	}
-	//统计投票结果
-	for {
-		//从votesCh等待结果
-		r := <-votesCh
-		resNum += 1
-		if r == true {
-			grantVotes += 1
-		}
-		//退出条件
-		if resNum == len(rf.peers) || grantVotes > len(rf.peers)/2 || resNum-grantVotes > len(rf.peers)/2 {
-			break
+			go func(server int, currentTerm int, args RequestVoteArgs) {
+				reply := RequestVoteReply{}
+				ok := rf.peers[server].Call("Raft.RequestVote", &args, &reply)
+				if ok {
+					rf.handleVoteResult(currentTerm, &reply)
+				}
+			}(server, rf.currentTerm, args)
 		}
 	}
-	if grantVotes <= len(rf.peers)/2 {
-		DPrintf("%v has %d Votes which less half", rf.me, grantVotes)
+}
+
+func (rf *Raft) handleVoteResult(currentTerm int, reply *RequestVoteReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	//检查是不是已经是新的任期
+	if currentTerm != rf.currentTerm {
 		return
 	}
-	rf.mu.Lock()
-	if rf.role == Leader {
-		rf.resetHeartBeatTimers()
+	//收到旧时期的包
+	if reply.Term < rf.currentTerm {
+		return
 	}
-	if rf.term == args.Term && rf.role == Candidate {
-		//还要检查是不是和发起请求的状态一致
-		rf.changeRole(Leader)
-		DPrintf("%d become leader,nextIndex:%v", rf.me, rf.nextIndex)
+	if reply.Term > rf.currentTerm {
+		rf.currentState = FOLLOWER
+		rf.currentTerm = reply.Term
+		rf.votedFor = -1
+		rf.persist()
+		rf.resetElectionTimer()
+		return
 	}
-	rf.mu.Unlock()
+	if reply.VoteGranted && rf.currentState == CANDIDATE {
+		rf.grantVotes++
+		if rf.grantVotes > len(rf.peers)/2 {
+			rf.currentState = LEADER
+			//DPrintf("[NewLeader],Server:%d become leader", rf.me)
+			//发送心跳包
+			for i := 0; i < len(rf.peers); i++ {
+				if i == rf.me {
+					continue
+				}
+				rf.resetHeartbeatTimer(rightnow)
+				rf.nextIndex[i] = rf.getLastIndex() + 1
+				rf.matchIndex[i] = 0
+			}
+			//rf.resetHeartbeatTimer(rightnow)
+			rf.resetElectionTimer()
+		}
+	}
+}
+
+func (rf *Raft) resetElectionTimer() {
+	rf.electionTimerLock.Lock()
+	if !rf.electionTimer.Stop() {
+		select {
+		case <-rf.electionTimer.C:
+		default:
+		}
+	}
+	rf.electionTimer.Reset(time.Duration(rand.Int())%electionTimeoutInterval + electionTimeOutStart)
+	rf.electionTimerLock.Unlock()
 }

@@ -72,6 +72,7 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 //
 func (ck *Clerk) Get(key string) string {
 	ck.requestId++
+
 	for {
 		args := GetArgs{
 			Key:       key,
@@ -90,12 +91,10 @@ func (ck *Clerk) Get(key string) string {
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
 					return reply.Value
 				}
-				//自己或者请求的服务器的config不同步，请求了错误的分组信息对应的服务器
 				if ok && (reply.Err == ErrWrongGroup) {
 					break
 				}
 				// ... not ok, or ErrWrongLeader
-				//这种情况直接选择另外的服务器重新请求
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
